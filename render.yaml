@@ -1,0 +1,19 @@
+services:
+  - type: worker          # Webサーバーではなくバックグラウンド常駐プロセス
+    name: amazon-monitor
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python amazon_monitor.py
+    envVars:
+      - key: PRODUCTS
+        sync: false       # ダッシュボードで入力（コードに書かない）
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+      - key: INTERVAL
+        value: "10"
+      - key: JITTER
+        value: "5"

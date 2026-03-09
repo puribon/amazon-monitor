@@ -1,0 +1,11 @@
+# 環境変数ファイル（絶対にGitHubにアップしない！）
+.env
+
+# Pythonキャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# ログ・状態ファイル
+*.log
+monitor_state.json
