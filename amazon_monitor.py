@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Amazon 在庫監視ツール - Railway デプロイ版
-設定はすべて環境変数から読み込みます（.env または Railwayのダッシュボード）
+Amazon 在庫監視ツール - bot回避強化版
+設定はすべて環境変数から読み込みます
 """
 
 import asyncio
@@ -25,15 +25,11 @@ from bs4 import BeautifulSoup
 # ============================================================
 
 def get_products():
-    """
-    環境変数 PRODUCTS からJSON形式で商品リストを読み込む
-    例: [{"asin":"B0CXXXXXXXXX","name":"PS5"},{"asin":"B0XXXXXXXXXX","name":"Switch"}]
-    """
     raw = os.environ.get("PRODUCTS", "[]")
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        logger.error("PRODUCTS の JSON が正しくありません。例: [{\"asin\":\"B0XXXXXXXXXX\",\"name\":\"商品名\"}]")
+        logger.error('PRODUCTS のJSON形式が正しくありません。例: [{"asin":"B0XXXXXXXXXX","name":"商品名"}]')
         return []
 
 CONFIG = {
@@ -44,15 +40,17 @@ CONFIG = {
         "password":  os.environ.get("EMAIL_PASS", ""),
         "to":        os.environ.get("EMAIL_TO",   ""),
     },
-    "interval_seconds":      float(os.environ.get("INTERVAL",        "10")),
-    "jitter_seconds":        float(os.environ.get("JITTER",           "5")),
-    "captcha_backoff_initial": int(os.environ.get("CAPTCHA_BACKOFF",  "60")),
-    "captcha_backoff_max":     int(os.environ.get("CAPTCHA_MAX",     "600")),
-    "request_timeout":         int(os.environ.get("REQUEST_TIMEOUT",  "12")),
+    "interval_seconds":        float(os.environ.get("INTERVAL",       "30")),
+    "jitter_seconds":          float(os.environ.get("JITTER",         "10")),
+    "captcha_backoff_initial": int(os.environ.get("CAPTCHA_BACKOFF",  "120")),
+    "captcha_backoff_max":     int(os.environ.get("CAPTCHA_MAX",      "900")),
+    "request_timeout":         int(os.environ.get("REQUEST_TIMEOUT",  "15")),
+    # 不明が連続して何回続いたら在庫なしと判定するか
+    "unknown_threshold":       int(os.environ.get("UNKNOWN_THRESHOLD", "3")),
 }
 
 # ============================================================
-#  ロギング（Railway はコンソール出力をそのまま表示）
+#  ロギング
 # ============================================================
 
 logging.basicConfig(
@@ -63,31 +61,105 @@ logging.basicConfig(
 logger = logging.getLogger("AmazonMonitor")
 
 # ============================================================
-#  User-Agent リスト
+#  User-Agent（最新のChromeに合わせる）
 # ============================================================
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+# ブラウザごとにセットで使うヘッダー情報
+BROWSER_PROFILES = [
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+    },
+    {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        "sec-ch-ua": '"Firefox";v="124"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    },
 ]
 
+def build_headers(profile: dict) -> dict:
+    """
+    本物のChromeが送るヘッダーを再現する。
+    sec-ch-ua系はChromeが自動で付けるヘッダーで、
+    これがないとbotと判定されやすい。
+    """
+    return {
+        "User-Agent":        profile["User-Agent"],
+        "Accept":            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language":   "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding":   "gzip, deflate, br",
+        "sec-ch-ua":         profile["sec-ch-ua"],
+        "sec-ch-ua-mobile":  profile["sec-ch-ua-mobile"],
+        "sec-ch-ua-platform": profile["sec-ch-ua-platform"],
+        "sec-fetch-dest":    "document",
+        "sec-fetch-mode":    "navigate",
+        "sec-fetch-site":    "none",
+        "sec-fetch-user":    "?1",
+        "upgrade-insecure-requests": "1",
+        "Cache-Control":     "max-age=0",
+    }
+
 # ============================================================
-#  セッション管理（CAPTCHA バックオフ付き）
+#  セッション管理
 # ============================================================
 
-class SessionPool:
+class SmartSession:
+    """
+    人間らしいブラウジングを再現するセッション管理クラス。
+    - トップページ訪問でクッキーを取得してから商品ページへ
+    - CAPTCHAが出たら指数バックオフで待機
+    - ブラウザプロファイルをランダムに切り替え
+    """
+
     def __init__(self):
         self._session = requests.Session()
+        self._profile = random.choice(BROWSER_PROFILES)
         self._captcha_backoff = CONFIG["captcha_backoff_initial"]
         self._blocked_until = 0.0
+        self._initialized = False  # トップページ訪問済みか
+
+    def _init_session(self):
+        """
+        最初の1回だけAmazonトップページを訪問してクッキーを取得する。
+        人間はいきなり商品ページを開かない、という動きを再現。
+        """
+        if self._initialized:
+            return
+        try:
+            logger.info("セッション初期化中（トップページ訪問）...")
+            self._session.get(
+                "https://www.amazon.co.jp",
+                headers=build_headers(self._profile),
+                timeout=CONFIG["request_timeout"],
+            )
+            # 人間らしく少し待つ
+            time.sleep(random.uniform(1.5, 3.0))
+            self._initialized = True
+            logger.info("セッション初期化完了")
+        except Exception as e:
+            logger.warning(f"セッション初期化失敗（続行します）: {e}")
+            self._initialized = True  # 失敗しても続行
+
+    def rotate_profile(self):
+        """ブラウザプロファイルとセッションを丸ごと切り替える"""
+        self._profile = random.choice(BROWSER_PROFILES)
+        self._session = requests.Session()
+        self._initialized = False
+        logger.info("ブラウザプロファイルを切り替えました")
 
     def report_captcha(self):
         wait = min(self._captcha_backoff, CONFIG["captcha_backoff_max"])
         self._blocked_until = time.time() + wait
-        logger.warning(f"CAPTCHA検出。{wait}秒バックオフ中...")
+        logger.warning(f"⚠️  CAPTCHA検出。{wait}秒待機後にプロファイル切り替えます...")
         self._captcha_backoff = min(self._captcha_backoff * 2, CONFIG["captcha_backoff_max"])
 
     def reset_backoff(self):
@@ -101,19 +173,21 @@ class SessionPool:
     def block_remaining(self):
         return max(0.0, self._blocked_until - time.time())
 
-    @property
-    def session(self):
-        return self._session
+    def get(self, url: str) -> requests.Response:
+        self._init_session()
+        headers = build_headers(self._profile)
+        return self._session.get(url, headers=headers, timeout=CONFIG["request_timeout"])
 
-session_pool = SessionPool()
+
+smart_session = SmartSession()
 
 # ============================================================
 #  在庫チェック
 # ============================================================
 
-IN_STOCK_SIGNALS    = ["カートに入れる", "今すぐ購入", "Add to Cart", "add-to-cart-button", "In Stock"]
-OUT_OF_STOCK_SIGNALS = ["現在在庫切れです", "在庫切れ", "Currently unavailable", "currently-unavailable", "この商品は現在お取り扱いできません"]
-
+IN_STOCK_SIGNALS     = ["カートに入れる", "今すぐ購入", "Add to Cart", "add-to-cart-button", "In Stock"]
+OUT_OF_STOCK_SIGNALS = ["現在在庫切れです", "在庫切れ", "Currently unavailable",
+                        "currently-unavailable", "この商品は現在お取り扱いできません"]
 
 def extract_asin(value: str):
     value = value.strip()
@@ -125,59 +199,93 @@ def extract_asin(value: str):
             return m.group(1).upper()
     return None
 
+def build_urls(asin: str) -> list:
+    """
+    複数のURLパターンを返す。
+    Amazonはページの構造が商品によって違うため、
+    複数パターンを試すことで取得精度が上がる。
+    """
+    return [
+        f"https://www.amazon.co.jp/dp/{asin}",
+        f"https://www.amazon.co.jp/gp/product/{asin}",
+    ]
 
-def build_url(asin: str) -> str:
-    return f"https://www.amazon.co.jp/dp/{asin}"
+def parse_stock(html: str) -> str:
+    """
+    HTMLから在庫状態を判定する。
+    より厳密に判定するため、複数の方法を組み合わせる。
+    """
+    soup = BeautifulSoup(html, "lxml")
 
+    # 方法1: availability div（最も信頼性が高い）
+    avail = soup.find(id="availability")
+    if avail:
+        text = avail.get_text(" ", strip=True)
+        logger.debug(f"availability テキスト: {text}")
+        if any(s in text for s in ["在庫あり", "In Stock", "通常", "入荷予定", "残り"]):
+            return "in_stock"
+        if any(s in text for s in ["在庫切れ", "Currently unavailable",
+                                    "現在在庫切れ", "お取り扱いできません", "販売中止"]):
+            return "out_of_stock"
 
-def check_stock_sync(url: str) -> str:
-    if session_pool.is_blocked:
+    # 方法2: カートボタンの存在
+    if soup.find(id="add-to-cart-button"):
+        return "in_stock"
+
+    # 方法3: 今すぐ購入ボタン
+    if soup.find(id="buy-now-button"):
+        return "in_stock"
+
+    # 方法4: フォールバック文字列検索
+    if any(s in html for s in OUT_OF_STOCK_SIGNALS):
+        return "out_of_stock"
+    if any(s in html for s in IN_STOCK_SIGNALS):
+        return "in_stock"
+
+    return "unknown"
+
+def check_stock_sync(asin: str) -> str:
+    """
+    在庫チェックのメイン処理。
+    複数URLを試して判定する。
+    """
+    if smart_session.is_blocked:
         return "blocked"
 
-    headers = {
-        "User-Agent":      random.choice(USER_AGENTS),
-        "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control":   "no-cache",
-        "DNT":             "1",
-    }
+    urls = build_urls(asin)
 
-    try:
-        resp = session_pool.session.get(url, headers=headers, timeout=CONFIG["request_timeout"])
-        resp.raise_for_status()
-        html = resp.text
+    for url in urls:
+        try:
+            resp = smart_session.get(url)
+            resp.raise_for_status()
+            html = resp.text
 
-        if "captcha" in html.lower() or "Type the characters" in html:
-            session_pool.report_captcha()
-            return "blocked"
+            # CAPTCHA検出
+            if "captcha" in html.lower() or "Type the characters" in html:
+                smart_session.report_captcha()
+                return "blocked"
 
-        session_pool.reset_backoff()
-        soup = BeautifulSoup(html, "lxml")
+            # ページが正常に取得できたか確認
+            # （Amazonがブロックした場合は正常なHTMLが返らない）
+            if "amazon.co.jp" not in html and len(html) < 5000:
+                logger.warning(f"不正なレスポンス（{len(html)}文字）: {url}")
+                continue
 
-        avail = soup.find(id="availability")
-        if avail:
-            text = avail.get_text(" ", strip=True)
-            if any(s in text for s in ["在庫あり", "In Stock", "通常", "入荷予定"]):
-                return "in_stock"
-            if any(s in text for s in ["在庫切れ", "Currently unavailable", "現在在庫切れ"]):
-                return "out_of_stock"
+            smart_session.reset_backoff()
+            status = parse_stock(html)
 
-        if soup.find(id="add-to-cart-button"):
-            return "in_stock"
+            # unknownの場合は次のURLを試す
+            if status != "unknown":
+                return status
 
-        if any(s in html for s in OUT_OF_STOCK_SIGNALS):
-            return "out_of_stock"
-        if any(s in html for s in IN_STOCK_SIGNALS):
-            return "in_stock"
+        except requests.Timeout:
+            logger.debug(f"タイムアウト: {url}")
+            continue
+        except requests.RequestException as e:
+            logger.debug(f"リクエストエラー: {e}")
+            continue
 
-        return "unknown"
-
-    except requests.Timeout:
-        return "unknown"
-    except requests.RequestException as e:
-        logger.debug(f"リクエストエラー: {e}")
-        return "unknown"
+    return "unknown"
 
 # ============================================================
 #  メール通知
@@ -186,7 +294,7 @@ def check_stock_sync(url: str) -> str:
 def send_email(product_name: str, asin: str, url: str):
     cfg = CONFIG["email"]
     if not cfg["username"] or not cfg["password"]:
-        logger.warning("メール設定が未入力のため通知をスキップします (EMAIL_USER / EMAIL_PASS)")
+        logger.warning("メール設定が未入力のため通知をスキップします")
         return
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -231,17 +339,28 @@ def send_email(product_name: str, asin: str, url: str):
 #  非同期チェックループ
 # ============================================================
 
-# メモリ上に在庫状態を保持（Railwayはファイルシステムが揮発性のため）
 state: dict = {}
-
+# 連続unknown回数を商品ごとに記録
+unknown_counts: dict = {}
 
 async def check_product_async(product: dict, executor: ThreadPoolExecutor):
     asin = product["asin"]
     name = product["name"]
-    url  = build_url(asin)
+    url  = f"https://www.amazon.co.jp/dp/{asin}"
 
     loop = asyncio.get_running_loop()
-    status = await loop.run_in_executor(executor, check_stock_sync, url)
+    status = await loop.run_in_executor(executor, check_stock_sync, asin)
+
+    # unknown が threshold 回続いたら out_of_stock と判定
+    # （Amazonのブロックによる誤判定を防ぐ）
+    if status == "unknown":
+        unknown_counts[asin] = unknown_counts.get(asin, 0) + 1
+        threshold = CONFIG["unknown_threshold"]
+        if unknown_counts[asin] >= threshold:
+            logger.warning(f"[{name}] ❓不明が{threshold}回続いたため在庫なしと判定")
+            status = "out_of_stock"
+    else:
+        unknown_counts[asin] = 0
 
     prev = state.get(asin, {}).get("status", "unknown")
     state.setdefault(asin, {}).update({
@@ -259,6 +378,7 @@ async def check_product_async(product: dict, executor: ThreadPoolExecutor):
     }.get(status, "❓ 不明")
     logger.info(f"[{name}] {label}")
 
+    # 在庫復活通知（out_of_stock → in_stock のときだけ）
     if status == "in_stock" and prev == "out_of_stock":
         logger.info(f"🎉 在庫復活: {name} → メール送信")
         await loop.run_in_executor(executor, send_email, name, asin, url)
@@ -267,31 +387,41 @@ async def check_product_async(product: dict, executor: ThreadPoolExecutor):
 async def monitor_loop(products: list):
     interval = CONFIG["interval_seconds"]
     jitter   = CONFIG["jitter_seconds"]
+    cycle    = 0
+    # 何サイクルごとにプロファイルを切り替えるか
+    ROTATE_EVERY = 20
 
     logger.info("=" * 55)
-    logger.info("🚀 Amazon 在庫監視ツール（Railway版）起動")
+    logger.info("🚀 Amazon 在庫監視ツール（bot回避強化版）起動")
     logger.info(f"   監視商品: {len(products)}件  |  基本間隔: {interval}秒 ±{jitter}秒")
     for p in products:
         logger.info(f"   - {p['name']} ({p['asin']})")
     logger.info("=" * 55)
 
-    cycle = 0
     with ThreadPoolExecutor(max_workers=max(len(products), 4)) as executor:
         while True:
             cycle += 1
-            start = time.perf_counter()
 
-            if session_pool.is_blocked:
-                remaining = session_pool.block_remaining
+            # 定期的にブラウザプロファイルを切り替える
+            if cycle % ROTATE_EVERY == 0:
+                smart_session.rotate_profile()
+
+            if smart_session.is_blocked:
+                remaining = smart_session.block_remaining
                 logger.warning(f"🚫 バックオフ中... あと {remaining:.0f}秒")
                 await asyncio.sleep(min(remaining, interval))
+                # バックオフ明けはプロファイルを切り替える
+                smart_session.rotate_profile()
                 continue
 
+            start = time.perf_counter()
+
+            # 商品を並列チェック
             await asyncio.gather(*[
                 check_product_async(p, executor) for p in products
             ])
 
-            elapsed   = time.perf_counter() - start
+            elapsed    = time.perf_counter() - start
             jitter_val = random.uniform(-jitter, jitter)
             wait       = max(1.0, interval + jitter_val - elapsed)
             logger.info(f"─── サイクル#{cycle} ({elapsed:.2f}秒) | 次回まで {wait:.1f}秒 ───")
